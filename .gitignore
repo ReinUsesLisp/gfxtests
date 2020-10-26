@@ -1,0 +1,6 @@
+*.7z
+*.elf
+*.nacp
+*.nro
+.vscode
+build

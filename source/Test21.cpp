@@ -1,0 +1,200 @@
+#include "SampleFramework/CDescriptorSet.h"
+#include "SampleFramework/CShader.h"
+#include "SampleFramework/CApplication.h"
+#include "SampleFramework/CMemPool.h"
+
+#include <array>
+#include <optional>
+
+namespace {
+
+class Test final : public CApplication
+{
+    static constexpr unsigned NumFramebuffers = 2;
+    static constexpr uint32_t FramebufferWidth = 1280;
+    static constexpr uint32_t FramebufferHeight = 720;
+    static constexpr unsigned StaticCmdSize = 4*1024*1024;
+
+    dk::UniqueDevice device;
+    dk::UniqueQueue queue;
+
+    std::optional<CMemPool> pool_images;
+    std::optional<CMemPool> pool_code;
+    std::optional<CMemPool> pool_data;
+
+    CShader vertexShader;
+    CShader fragmentShader;
+
+    dk::UniqueCmdBuf cmdbuf;
+
+    CMemPool::Handle framebuffers_mem[NumFramebuffers];
+    dk::Image framebuffers[NumFramebuffers];
+    DkCmdList framebuffer_cmdlists[NumFramebuffers];
+    dk::UniqueSwapchain swapchain;
+
+    CDescriptorSet<16> imageDescriptorSet;
+    CDescriptorSet<16> samplerDescriptorSet;
+
+    DkCmdList render_cmdlist;
+
+public:
+    Test()
+    {
+        device = dk::DeviceMaker{}.create();
+
+        queue = dk::QueueMaker{device}.setFlags(DkQueueFlags_Graphics).create();
+
+        pool_images.emplace(device, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, 16*1024*1024);
+        pool_data.emplace(device, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, 16*1024*1024);
+        pool_code.emplace(device, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code, 128*1024);
+
+        cmdbuf = dk::CmdBufMaker{device}.create();
+        CMemPool::Handle cmdmem = pool_data->allocate(StaticCmdSize);
+        cmdbuf.addMemory(cmdmem.getMemBlock(), cmdmem.getOffset(), cmdmem.getSize());
+
+        createFramebufferResources();
+    }
+
+    ~Test()
+    {
+        // Destroy the framebuffer resources
+        destroyFramebufferResources();
+    }
+
+    void createFramebufferResources()
+    {
+        dk::ImageLayout layout_framebuffer;
+        dk::ImageLayoutMaker{device}
+            .setFlags(DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression)
+            .setFormat(DkImageFormat_RGBA8_Unorm)
+            .setDimensions(FramebufferWidth, FramebufferHeight)
+            .initialize(layout_framebuffer);
+
+        dk::ImageLayout layout_test;
+        dk::ImageLayoutMaker{device}
+            .setFlags(DkImageFlags_HwCompression)
+            .setFormat(DkImageFormat_RGBA8_Unorm)
+            .setDimensions(512, 512, 3)
+            .setType(DkImageType_2DArray)
+            .initialize(layout_test);
+
+        auto test_allocation = pool_images->allocate(layout_test.getSize(), layout_test.getAlignment());
+        auto test_block = test_allocation.getMemBlock();
+
+        auto mem = static_cast<u8*>(test_block.getCpuAddr());
+        for (int c = 0; c < 3; ++c) {
+            for (int y = 0; y < 512; ++y) {
+                for (int x = 0; x < 512; ++x) {
+                    int off = (c * 512*512 + y*512 + x) * 4;
+                    memset(mem + off, 0, 4);
+                    mem[off + c] = 255;
+                }
+            }
+        }
+
+        dk::Image test_image;
+        test_image.initialize(layout_test, test_block, test_allocation.getOffset());
+
+        std::array<dk::ImageDescriptor, 3> descriptors;
+        for (size_t i = 0; i < descriptors.size(); ++i) {
+            descriptors[i].initialize(
+                dk::ImageView{test_image}
+                    .setType(DkImageType_2D)
+                    .setLayers(i, 1)
+            );
+        }
+
+        imageDescriptorSet.allocate(*pool_data);
+        samplerDescriptorSet.allocate(*pool_data);
+
+        vertexShader.load(*pool_code, "romfs:/shaders/full_tri_vsh.dksh");
+        fragmentShader.load(*pool_code, "romfs:/shaders/sample_fsh.dksh");
+
+        dk::Sampler sampler;
+        sampler.setFilter(DkFilter_Linear, DkFilter_Linear);
+        sampler.setWrapMode(DkWrapMode_ClampToEdge, DkWrapMode_ClampToEdge, DkWrapMode_ClampToEdge);
+
+        dk::SamplerDescriptor samplerDescriptor;
+        samplerDescriptor.initialize(sampler);
+
+        std::array<DkImage const*, NumFramebuffers> fb_array;
+        uint64_t fb_size  = layout_framebuffer.getSize();
+        uint32_t fb_align = layout_framebuffer.getAlignment();
+        for (unsigned i = 0; i < NumFramebuffers; i ++)
+        {
+            samplerDescriptorSet.update(cmdbuf, 0, samplerDescriptor);
+            for (size_t i = 0; i < descriptors.size(); ++i) {
+                imageDescriptorSet.update(cmdbuf, i, descriptors[i]);
+            }
+            imageDescriptorSet.bindForImages(cmdbuf);
+            samplerDescriptorSet.bindForSamplers(cmdbuf);
+
+            framebuffers_mem[i] = pool_images->allocate(fb_size, fb_align);
+            framebuffers[i].initialize(layout_framebuffer, framebuffers_mem[i].getMemBlock(), framebuffers_mem[i].getOffset());
+
+            dk::ImageView colorTarget{ framebuffers[i] };
+
+            cmdbuf.bindRenderTargets(&colorTarget);
+            framebuffer_cmdlists[i] = cmdbuf.finishList();
+
+            fb_array[i] = &framebuffers[i];
+        }
+
+        swapchain = dk::SwapchainMaker{device, nwindowGetDefault(), fb_array}.create();
+
+        recordStaticCommands();
+    }
+
+    void destroyFramebufferResources()
+    {
+        if (!swapchain) return;
+
+        queue.waitIdle();
+        cmdbuf.clear();
+        swapchain.destroy();
+
+        for (unsigned i = 0; i < NumFramebuffers; i ++)
+            framebuffers_mem[i].destroy();
+    }
+
+    void recordStaticCommands()
+    {
+        cmdbuf.setScissors(0, { { 0, 0, FramebufferWidth, FramebufferHeight } });
+        cmdbuf.clearColor(0, DkColorMask_RGBA, 0.0f, 0.25f, 0.0f, 1.0f);
+
+        for (int x = 0; x < 256; ++x) {
+            for (int y = 0; y < x; ++y) {
+                cmdbuf.setScissors(0, { { x, y, 0, 0 } });
+                cmdbuf.clearColor(0, DkColorMask_RGBA, 1.0f, 0.0f, 0.0f, 1.0f);
+            }
+        }
+
+        render_cmdlist = cmdbuf.finishList();
+    }
+
+    void render()
+    {
+        int slot = queue.acquireImage(swapchain);
+        queue.submitCommands(framebuffer_cmdlists[slot]);
+        queue.submitCommands(render_cmdlist);
+        queue.presentImage(swapchain, slot);
+    }
+
+    bool onFrame(u64 ns) override
+    {
+        hidScanInput();
+        if (hidKeysDown(CONTROLLER_P1_AUTO) & KEY_PLUS) {
+            return false;
+        }
+        render();
+        return true;
+    }
+};
+
+} // Anonymous namespace
+
+void Test21()
+{
+    Test app;
+    app.run();
+}
